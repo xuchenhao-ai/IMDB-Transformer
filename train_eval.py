@@ -18,6 +18,7 @@ import os
 import random
 import sys
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, NamedTuple, Optional
 
@@ -51,6 +52,39 @@ class TeeLogger:
 
     def close(self):
         self.file.close()
+
+
+def _make_unraisablehook(log_path: str):
+    """避免默认 hook 向已关闭的 Tee 写 stderr 时嵌套报错；同时追加到 training_log。"""
+
+    def unraisablehook(unraisable):
+        try:
+            if unraisable.exc_type is not None:
+                if unraisable.exc_traceback is not None:
+                    body = "".join(
+                        traceback.format_exception(
+                            unraisable.exc_type,
+                            unraisable.exc_value,
+                            unraisable.exc_traceback,
+                        )
+                    )
+                else:
+                    body = "".join(
+                        traceback.format_exception_only(
+                            unraisable.exc_type, unraisable.exc_value
+                        )
+                    )
+            else:
+                body = f"{getattr(unraisable, 'err_msg', '') or unraisable.exc_value or unraisable!r}\n"
+            block = "\n[sys.unraisablehook]\n" + body
+            sys.__stderr__.write(block)
+            sys.__stderr__.flush()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(block)
+        except Exception:
+            pass
+
+    return unraisablehook
 
 
 @dataclass
@@ -647,6 +681,7 @@ def main():
     output_root = os.path.abspath(args.output_dir)
     log_file = ensure_logs_dir(output_root)
     logger = TeeLogger(log_file)
+    sys.unraisablehook = _make_unraisablehook(log_file)
     sys.stdout = logger
     sys.stderr = logger
 
@@ -685,7 +720,19 @@ def main():
             run_tokenizer_compare(cfg, output_root, device)
             return
 
+    except Exception:
+        # 直接写盘与真实 stderr，避免 Tee 在崩溃路径上未 flush 时丢栈
+        err = traceback.format_exc()
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("\n[FATAL] uncaught in main:\n" + err)
+        except OSError:
+            pass
+        sys.__stderr__.write("\n[FATAL] uncaught in main:\n" + err)
+        raise
     finally:
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
         logger.flush()
         logger.close()
 
