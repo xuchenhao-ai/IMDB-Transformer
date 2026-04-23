@@ -13,9 +13,9 @@ Lab03 情感分析 — load_dataset.py（CSV → 清洗 → train/val/test 划�
   build_vocab             仅用训练集词频，special：<pad>=0,<unk>=1,[CLS]=2,[SEP]=3。
   text_to_indices         whitespace： [CLS]+内容+[SEP]，右补 <pad>；pretrained：句首无 CLS、max_length
                           右端以 pad（GPT-2 上常为 eos_id）填充。
-  build_tensor_datasets   train / val / test 三套 TensorDataset。
-  dataset_to_gpu          整集 .to(device)，训练时按 batch 切片。
-  try_build_hf_tokenizer  可选加载 transformers AutoTokenizer。
+  build_tensor_datasets   train / val / test 三套 TensorDataset（张量在 CPU）。
+  make_dataloaders        标准 DataLoader，num_workers=4，train shuffle。
+  try_build_hf_tokenizer  可选加载 transformers AutoTokenizer；默认优先本目录下 my_gpt2_folder 离线加载。
 
 张量形状示例（max_seq_len=L）
   train_x / val_x / test_x : (N_train, L)、(N_val, L)、(N_test, L)；y 为 (N,) float32。
@@ -26,11 +26,18 @@ Lab03 情感分析 — load_dataset.py（CSV → 清洗 → train/val/test 划�
 import os
 import re
 from collections import Counter
+from typing import Optional, Tuple
 
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data import TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
+
+# 与 train_eval 训练入口共用；在 train 上 shuffle、val/test 顺序遍历。
+DATALOADER_NUM_WORKERS = 4
+
+# 将 Hugging Face 的 gpt2 tokenizer 文件保存到此目录（与 load_dataset.py 同级）即可无网加载。
+LOCAL_GPT2_TOKENIZER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_gpt2_folder")
 
 
 def load_data(csv_path="/data/lujd/xuchenhao/Homework/26DeepLearing/Lab03/imdb_sentiment_data.csv"):
@@ -183,17 +190,54 @@ def build_tensor_datasets(
     return TensorDataset(train_x, train_y), TensorDataset(val_x, val_y), TensorDataset(test_x, test_y)
 
 
-def dataset_to_gpu(dataset, device):
-    """整集搬到 GPU"""
-    x, y = dataset.tensors[0], dataset.tensors[1]
-    nb = device.type == "cuda"
-    return x.to(device, non_blocking=nb), y.to(device, non_blocking=nb)
+def make_dataloaders(
+    train_dataset: TensorDataset,
+    val_dataset: TensorDataset,
+    test_dataset: TensorDataset,
+    batch_size: int,
+    *,
+    pin_memory: bool,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """train：shuffle；val/test：不 shuffle。`pin_memory` 在 CUDA 上建议为 True 以配合 non_blocking 传到 GPU。"""
+    n_workers = DATALOADER_NUM_WORKERS
+    kw: dict = {
+        "batch_size": batch_size,
+        "num_workers": n_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": n_workers > 0,
+    }
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **kw)
+    val_loader = DataLoader(val_dataset, shuffle=False, **kw)
+    test_loader = DataLoader(test_dataset, shuffle=False, **kw)
+    return train_loader, val_loader, test_loader
 
+def try_build_hf_tokenizer(
+    preferred_name="gpt2",
+    local_tokenizer_dir: Optional[str] = None,
+):
+    """加载 GPT-2 分词器。
 
-def try_build_hf_tokenizer(preferred_name="gpt2"):
+    - 若 ``local_tokenizer_dir``（或默认 ``LOCAL_GPT2_TOKENIZER_DIR``，即本文件旁的 ``my_gpt2_folder``）
+      为有效目录，则 ``AutoTokenizer.from_pretrained(..., local_files_only=True)``，不访问网络。
+    - 否则回退为 ``from_pretrained(preferred_name)``（可用 HF 缓存或联网）。
+    """
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(preferred_name, use_fast=True)
+
+        local_root = os.path.abspath(os.path.expanduser(local_tokenizer_dir or LOCAL_GPT2_TOKENIZER_DIR))
+        if os.path.isdir(local_root):
+            tokenizer = AutoTokenizer.from_pretrained(
+                local_root,
+                use_fast=True,
+                local_files_only=True,
+            )
+            print(f"[INFO] Loaded tokenizer from local dir: {local_root}", flush=True)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(preferred_name, use_fast=True)
+            print(
+                f"[INFO] Local tokenizer dir not found ({local_root!r}), using pretrained id {preferred_name!r}",
+                flush=True,
+            )
 
         # GPT2 没有 pad token → 必须补
         if tokenizer.pad_token is None:

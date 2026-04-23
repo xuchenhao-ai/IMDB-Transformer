@@ -28,6 +28,12 @@ def ensure_parent_dir(path):
         os.makedirs(directory, exist_ok=True)
 
 
+def _savefig_current_png(path, dpi=200):
+    """经真实磁盘文件句柄保存，避免 Pillow 在部分环境对非 fileno 流报错（如 _idat / fileno）。"""
+    with open(path, "wb") as fh:
+        plt.savefig(fh, format="png", dpi=dpi)
+
+
 def plot_training_four_curves(history, save_path, title):
     """绘制 train/val 的 loss 与 F1 四条曲线。"""
     ensure_parent_dir(save_path)
@@ -45,7 +51,7 @@ def plot_training_four_curves(history, save_path, title):
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    _savefig_current_png(save_path)
     plt.close()
 
 
@@ -71,7 +77,8 @@ def plot_confusion_heatmap(y_true, y_pred, save_path, title="Confusion matrix"):
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title(title)
     fig.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    with open(save_path, "wb") as fh:
+        fig.savefig(fh, format="png", dpi=200)
     plt.close(fig)
 
 
@@ -112,5 +119,5 @@ def plot_attention_heatmap(attn_weights, tokens, save_path, head_index=0, title=
     plt.ylabel("Query")
     plt.title(title or f"Attention head {head_index}")
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    _savefig_current_png(save_path)
     plt.close()

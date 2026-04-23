@@ -1,8 +1,8 @@
 """
 Lab03 情感分析 — train_eval.py（训练入口；按实验类型分子目录产出）
 
-数据：load_dataset 仍为 train/val/test 三路划分；TrainingData 含 X_test/Y_test/test_texts（已拷 GPU）。
-当前训练、曲线、混淆矩阵、注意力图仅使用 train+val；测试集保留供日后补评估，本脚本不读取 X_test 做指标。
+数据：TensorDataset 在 CPU；训练用 DataLoader（num_workers=4）按 batch 传 GPU。
+当前训练、曲线、混淆矩阵、注意力图仅使用 train+val；test_loader 与 test_texts 保留供日后评估。
 
 配置：tokenizer_mode（whitespace | pretrained）、pos_encoding_mode、causal 等在 ExperimentConfig / CLI 中保留。
 
@@ -10,6 +10,7 @@ Lab03 情感分析 — train_eval.py（训练入口；按实验类型分子目�
   <output>/{single|sweep|position|compare|tokenizer_compare}/<run_name>/{four_curves,confusion,attn_head0}.png、best.pt、table.csv；
   tokenizer_compare 目录另有 summary.csv（whitespace vs pretrained 各一列对比）。
   sweep 另有 group_<param>.csv、summary.csv 等。
+  test 模式：在 test_result/<run_name>/ 下产出与 single 相同文件，并额外有 confusion_test.png、table.csv 中 test_* 列与 test_error_samples.csv。
 """
 
 import argparse
@@ -26,10 +27,17 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from autocuda import auto_cuda
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from torch.utils.data import DataLoader
 
-from load_dataset import build_tensor_datasets, build_vocab, dataset_to_gpu, load_and_preprocess_data, try_build_hf_tokenizer
+from load_dataset import (
+    DATALOADER_NUM_WORKERS,
+    build_tensor_datasets,
+    build_vocab,
+    load_and_preprocess_data,
+    make_dataloaders,
+    try_build_hf_tokenizer,
+)
 from models import AttentionClassifier, RNNClassifier
 from visualize import plot_attention_heatmap, plot_confusion_heatmap, plot_training_four_curves
 
@@ -96,16 +104,16 @@ class ExperimentConfig:
     pos_encoding_mode: str = "rope"
     causal: bool = False
 
-    embed_dim: int = 256
+    embed_dim: int = 384 # Attention模型使用
     num_heads: int = 4
     num_layers: int = 4
-    hidden_dim: int = 256
+    hidden_dim: int = 256 # RNN模型使用
 
     dropout: float = 0.1
-    lr: float = 3e-4
+    lr: float = 1e-4
     weight_decay: float = 1e-2
 
-    batch_size: int = 1024
+    batch_size: int = 128
     epochs: int = 10
 
     max_vocab_size: int = 60000
@@ -113,30 +121,30 @@ class ExperimentConfig:
 
 
 class TrainingData(NamedTuple):
-    """词表 + train/val/test 张量已在 device；test_texts 与 X_test 行对齐（当前流程不用于评估）。
-
-    含 pad_id、vocab_size、pooling、hf_tokenizer，供建模型与可视化；pretrained 时 vocab 可能为 None。
-    """
+    """词表 + train/val/test 的 DataLoader；val_x0 为验证集首条 (1,L) CPU 张量，供注意力图。"""
 
     vocab: Optional[dict]
-    X_train: torch.Tensor
-    Y_train: torch.Tensor
-    X_val: torch.Tensor
-    Y_val: torch.Tensor
-    X_test: torch.Tensor
-    Y_test: torch.Tensor
+    train_loader: DataLoader
+    val_loader: DataLoader
+    test_loader: DataLoader
+
+    val_x0: torch.Tensor
+
     test_texts: list
     pad_id: int
     vocab_size: int
     pooling: str
     hf_tokenizer: Any
 
-def build_data_pipeline(config):
+def build_data_pipeline(config: ExperimentConfig):
     tokenizer = None
     if config.tokenizer_mode == "pretrained":
         tokenizer = try_build_hf_tokenizer(config.tokenizer_name)
         if tokenizer is None:
+            config.tokenizer_mode = "whitespace"
             print("[WARN] pretrained tokenizer unavailable, fallback to whitespace", flush=True)
+        else:
+            print("[INFO] pretrained tokenizer available", flush=True)
 
     train_texts, val_texts, test_texts, train_labels, val_labels, test_labels = load_and_preprocess_data()
 
@@ -159,14 +167,14 @@ def build_data_pipeline(config):
     if tokenizer is not None:
         pad_id = int(tokenizer.pad_token_id)
         vocab_size = len(tokenizer)
-        pooling = "mean"
+        pooling = "mean" # 将最后一层的所有向量做mean pooling，得到一个向量，再通过分类器得到logits
     else:
         pad_id = int(vocab["<pad>"])
         vocab_size = len(vocab)
-        pooling = "cls"
+        pooling = "cls" # 只对最后一层[CLS]对应的token做分类
     return vocab, train_set, val_set, test_set, list(test_texts), tokenizer, pad_id, vocab_size, pooling
 
-def load_training_data_to_device(config: ExperimentConfig, device) -> TrainingData:
+def load_training_data(config: ExperimentConfig, device) -> TrainingData:
     (
         vocab,
         train_set,
@@ -178,22 +186,28 @@ def load_training_data_to_device(config: ExperimentConfig, device) -> TrainingDa
         vocab_size,
         pooling,
     ) = build_data_pipeline(config)
-    X_train, Y_train = dataset_to_gpu(train_set, device)
-    X_val, Y_val = dataset_to_gpu(val_set, device)
-    X_test, Y_test = dataset_to_gpu(test_set, device)
+    pin = device.type == "cuda"
+    train_loader, val_loader, test_loader = make_dataloaders(
+        train_set,
+        val_set,
+        test_set,
+        batch_size=config.batch_size,
+        pin_memory=pin,
+    )
+    vx, _ = val_set[0]
+    val_x0 = vx.unsqueeze(0).contiguous()
     print(
         f"[data] tokenizer_mode={config.tokenizer_mode!r} pad_id={pad_id} pooling={pooling} |vocab|={vocab_size} "
-        f"train={tuple(X_train.shape)} val={tuple(X_val.shape)} test={tuple(X_test.shape)}",
+        f"train={len(train_set)} val={len(val_set)} test={len(test_set)} | "
+        f"DataLoader num_workers={DATALOADER_NUM_WORKERS} batch_size={config.batch_size} pin_memory={pin}",
         flush=True,
     )
     return TrainingData(
         vocab,
-        X_train,
-        Y_train,
-        X_val,
-        Y_val,
-        X_test,
-        Y_test,
+        train_loader,
+        val_loader,
+        test_loader,
+        val_x0,
         test_texts,
         pad_id,
         vocab_size,
@@ -214,17 +228,7 @@ def set_seed(seed=42):
 def get_device_or_fail():
     if not torch.cuda.is_available():
         raise RuntimeError("No CUDA device found.")
-
-    best_gpu = 0
-    max_free = 0
-
-    for i in range(torch.cuda.device_count()):
-        free, total = torch.cuda.mem_get_info(i)
-        if free > max_free:
-            max_free = free
-            best_gpu = i
-
-    return torch.device(f"cuda:{best_gpu}")
+    return torch.device(f"cuda:0")
 
 
 def ensure_logs_dir(output_root: str) -> str:
@@ -296,85 +300,193 @@ def unwrap_output(outputs):
     return outputs, None
 
 
-def train_one_epoch(model, inputs, labels, criterion, optimizer, device, batch_size):
+def train_one_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
-    y_true, y_prob = [], []
+    y_parts, p_parts = [], []
     total_loss, total_n = 0.0, 0
-    n = inputs.size(0)
-    perm = torch.randperm(n, device=device) # 打乱
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        idx = perm[start:end]
-        x = inputs[idx]
-        y = labels[idx]
+    for x, y in train_loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        # 模型前向传播输出logits和attn，logits是[batch_size]的tensor，元素为概率值；attn是[batch_size, num_heads, seq_len, seq_len]的tensor
-        logits, attn = unwrap_output(model(x))
+        logits, _ = unwrap_output(model(x))
         loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
 
         probs = torch.sigmoid(logits)
-        y_true.extend(y.detach().cpu().numpy().tolist())
-        y_prob.extend(probs.detach().cpu().numpy().tolist())
+        y_parts.append(y.detach().cpu())
+        p_parts.append(probs.detach().cpu())
         total_loss += loss.item() * y.size(0)
         total_n += y.size(0)
 
-    # 计算metrics字典，包括accuracy、precision、recall、f1，loss平均损失
-    metrics = compute_metrics(np.asarray(y_true), np.asarray(y_prob))
+    y_true = torch.cat(y_parts).numpy()
+    y_prob = torch.cat(p_parts).numpy()
+    metrics = compute_metrics(y_true, y_prob)
     metrics["loss"] = total_loss / max(total_n, 1)
     return metrics
 
 
 @torch.no_grad()
-def evaluate(model, inputs, labels, criterion, device, batch_size):
-    """仅评估指标；注意力可视化在 train_model 中对单条样本前向单独计算。"""
+def evaluate(model, val_loader, criterion, device):
+    """仅评估指标；注意力可视化在 train_model 中对 val_x0 单独前向。"""
     model.eval()
-    y_true, y_prob = [], []
+    y_parts, p_parts = [], []
     total_loss, total_n = 0.0, 0
-    n = inputs.size(0)
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        x = inputs[start:end]
-        y = labels[start:end]
+    for x, y in val_loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         logits, _ = unwrap_output(model(x))
         loss = criterion(logits, y)
         probs = torch.sigmoid(logits)
-
-        y_true.extend(y.detach().cpu().numpy().tolist())
-        y_prob.extend(probs.detach().cpu().numpy().tolist())
+        y_parts.append(y.detach().cpu())
+        p_parts.append(probs.detach().cpu())
         total_loss += loss.item() * y.size(0)
         total_n += y.size(0)
 
-    metrics = compute_metrics(np.asarray(y_true), np.asarray(y_prob))
+    y_true = torch.cat(y_parts).numpy()
+    y_prob = torch.cat(p_parts).numpy()
+    metrics = compute_metrics(y_true, y_prob)
     metrics["loss"] = total_loss / max(total_n, 1)
     return metrics
 
 
+
 @torch.no_grad()
-# 跑一遍前向传播，收集验证集X上的所有概率值
-def collect_all_probs(model, X, batch_size, device):
+def collect_loader_probs_and_labels(model, loader, device):
+    """顺序遍历任意 DataLoader，返回 (probs, y_true) 一维 numpy。"""
     model.eval()
-    parts = []
-    n = X.size(0)
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        xb = X[start:end]
-        logits, _ = unwrap_output(model(xb))
-        parts.append(torch.sigmoid(logits).cpu())
-    return torch.cat(parts).numpy()
+    p_parts, y_parts = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        logits, _ = unwrap_output(model(x))
+        p_parts.append(torch.sigmoid(logits).detach().cpu())
+        y_parts.append(y)
+    probs = torch.cat(p_parts).numpy().ravel()
+    y_true = torch.cat(y_parts).numpy().ravel()
+    return probs, y_true
+
+
+def best_hyperparam_config() -> ExperimentConfig:
+    """固定一组表现较好的超参，供 test 模式完整训练 + 测试集评估使用。"""
+    return ExperimentConfig(
+        model_type="attention",
+        tokenizer_mode="pretrained",
+        tokenizer_name="gpt2",
+        pos_encoding_mode="rope",
+        causal=False,
+        embed_dim=256,
+        num_heads=8,
+        num_layers=4,
+        hidden_dim=256,
+        dropout=0.1,
+        lr=3e-4,
+        weight_decay=1e-3,
+        batch_size=512,
+        epochs=10,
+        max_vocab_size=60000,
+        max_seq_len=200,
+    )
+def _append_test_metrics_and_error_samples(
+    run_dir: str,
+    test_metrics: dict,
+    test_texts: list,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    run_title: str,
+    max_error_print: int = 8,
+    max_error_csv: int = 50,
+):
+    """在 table.csv 中追加测试集指标；保存测试混淆矩阵图；打印并可选落盘错误样例。"""
+    y_pred = (y_prob >= 0.5).astype(int)
+    plot_confusion_heatmap(
+        y_true,
+        y_pred,
+        os.path.join(run_dir, "confusion_test.png"),
+        title=f"{run_title} test confusion",
+    )
+
+    table_path = os.path.join(run_dir, "table.csv")
+    if os.path.isfile(table_path):
+        df = pd.read_csv(table_path)
+    else:
+        df = pd.DataFrame()
+    for k, v in test_metrics.items():
+        df[f"test_{k}"] = [v]
+    df.to_csv(table_path, index=False)
+
+    err_rows = []
+    for i in range(len(y_true)):
+        if int(y_true[i]) != int(y_pred[i]):
+            snippet = test_texts[i].replace("\n", " ").strip()
+            if len(snippet) > 240:
+                snippet = snippet[:240] + "…"
+            err_rows.append(
+                {
+                    "index": i,
+                    "text_snippet": snippet,
+                    "y_true": int(y_true[i]),
+                    "y_pred": int(y_pred[i]),
+                    "prob_positive": float(y_prob[i]),
+                }
+            )
+
+    if err_rows:
+        err_csv = os.path.join(run_dir, "test_error_samples.csv")
+        save_rows_csv(err_rows[:max_error_csv], err_csv)
+        print(f"\n[{run_title}] 测试集错分样例（最多 {max_error_print} 条，详见 {err_csv}）:", flush=True)
+        for row in err_rows[:max_error_print]:
+            print(
+                f"  idx={row['index']} true={row['y_true']} pred={row['y_pred']} "
+                f"P(y=1)={row['prob_positive']:.4f} | {row['text_snippet']}",
+                flush=True,
+            )
+    else:
+        print(f"\n[{run_title}] 测试集无错分（或样本为空）。", flush=True)
+
+
+def test_model(output_root: str, device):
+    """使用最优超参跑一次与 single 相同的训练与产出，目录为 output/test_result/<run_name>/；最后在测试集上评估并记录混淆矩阵与错分样例。"""
+    cfg = best_hyperparam_config()
+    set_seed(42)
+    data = load_training_data(cfg, device)
+    run_name = "attention_best"
+    result = run_one(cfg, output_root, "test_result", run_name, device, data)
+
+    ckpt = torch.load(result["ckpt_path"], map_location=device)
+    model = build_model(
+        cfg,
+        data.vocab_size,
+        data.pad_id,
+        pooling=data.pooling,
+    ).to(device)
+    model.load_state_dict(ckpt["final_best_state_dict"])
+
+    criterion = nn.BCEWithLogitsLoss()
+    test_m = evaluate(model, data.test_loader, criterion, device)
+    probs, y_true = collect_loader_probs_and_labels(model, data.test_loader, device)
+
+    print(
+        f"\n[{run_name}] 测试集 | Accuracy={test_m['accuracy']:.4f} Precision={test_m['precision']:.4f} "
+        f"Recall={test_m['recall']:.4f} F1-score={test_m['f1']:.4f} Loss={test_m['loss']:.4f}",
+        flush=True,
+    )
+    _append_test_metrics_and_error_samples(
+        result["run_dir"],
+        test_m,
+        data.test_texts,
+        y_true,
+        probs,
+        run_title=run_name,
+    )
 
 
 def train_model(
     model,
     vocab: Optional[dict],
-    X_train,
-    Y_train,
-    X_val,
-    Y_val,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    val_x0: torch.Tensor,
     config: ExperimentConfig,
     device,
     run_dir: str,  # 本次实验所有结果保存的目录
@@ -387,7 +499,7 @@ def train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     print(
-        f"Dataset tensors on {device}: train {tuple(X_train.shape)}, val {tuple(X_val.shape)}",
+        f"DataLoader → {device}: train={len(train_loader.dataset)} val={len(val_loader.dataset)}",
         flush=True,
     )
 
@@ -398,8 +510,8 @@ def train_model(
 
     t0 = time.time()
     for epoch in range(1, config.epochs + 1):
-        train_m = train_one_epoch(model, X_train, Y_train, criterion, optimizer, device, config.batch_size)
-        val_m = evaluate(model, X_val, Y_val, criterion, device, config.batch_size)
+        train_m = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_m = evaluate(model, val_loader, criterion, device)
 
         history["train_loss"].append(train_m["loss"])
         history["val_loss"].append(val_m["loss"])
@@ -422,14 +534,14 @@ def train_model(
     model.load_state_dict(best_state)
 
     # 将历史最优在验证集上跑一遍
-    val_m = evaluate(model, X_val, Y_val, criterion, device, config.batch_size)
+    val_m = evaluate(model, val_loader, criterion, device)
 
     ckpt_path = os.path.join(run_dir, "best.pt")
     # 1. 保存模型参数与配置到best.pt文件
     torch.save(
         {
-            "final_best_state_dict": best_state, # 历史最优的模型参数
-            "best_epoch": best_epoch, 
+            "final_best_state_dict": best_state,  # 历史最优的模型参数
+            "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
             "config": asdict(config),
         },
@@ -438,9 +550,8 @@ def train_model(
     # 2. 画训练曲线four_curves.png，包括train_loss、val_loss、train_f1、val_f1
     plot_training_four_curves(history, os.path.join(run_dir, "four_curves.png"), f"{run_title} curves")
 
-    # 3. 画验证集混淆矩阵confusion.png
-    probs = collect_all_probs(model, X_val, config.batch_size, device)
-    y_true_np = Y_val.detach().cpu().numpy().ravel()
+    # 3. 画验证集混淆矩阵 confusion.png
+    probs, y_true_np = collect_loader_probs_and_labels(model, val_loader, device)
     y_pred_np = (probs >= 0.5).astype(int)
     plot_confusion_heatmap(
         y_true_np,
@@ -452,9 +563,10 @@ def train_model(
     # 4. 画验证集注意力图attn_head0.png，选择第一张图的最后一层注意力的第一个注意力头
     if config.model_type == "attention":
         with torch.no_grad():
-            _, attn = unwrap_output(model(X_val[:1]))
+            x0 = val_x0.to(device, non_blocking=True)
+            _, attn = unwrap_output(model(x0))
         if attn is not None:
-            ids = X_val[0].detach().cpu().tolist()
+            ids = val_x0[0].detach().cpu().tolist()
             if hf_tokenizer is not None:
                 tokens = [hf_tokenizer.convert_ids_to_tokens(i) for i in ids if i != pad_id]
             else:
@@ -523,10 +635,6 @@ def run_one(
     print(f"Device: {device}", flush=True)
     print(f"Config: {json.dumps(asdict(config), ensure_ascii=False)}", flush=True)
 
-    vocab = data.vocab
-    X_train, Y_train = data.X_train, data.Y_train
-    X_val, Y_val = data.X_val, data.Y_val
-
     model = build_model(
         config,
         data.vocab_size,
@@ -535,11 +643,10 @@ def run_one(
     ).to(device)
     return train_model(
         model,
-        vocab,
-        X_train,
-        Y_train,
-        X_val,
-        Y_val,
+        data.vocab,
+        data.train_loader,
+        data.val_loader,
+        data.val_x0,
         config,
         device,
         run_dir,
@@ -607,12 +714,16 @@ def run_model_compare(base: ExperimentConfig, output_root: str, device, data: Tr
 
 
 def run_tokenizer_compare(base: ExperimentConfig, output_root: str, device):
-    """在其余超参相同的前提下，分别用 whitespace 与 pretrained 重建数据并各训一套模型，结果写入 tokenizer_compare/summary.csv。"""
+    """whitespace 与 pretrained 各重建数据与 DataLoader 并各训一套；结果写入 tokenizer_compare/summary.csv。"""
     rows = []
     for tm in ["whitespace", "pretrained"]:
         cfg = ExperimentConfig(**asdict(base))
+        if tm == "pretrained":
+            cfg.tokenizer_name = "gpt2"
+        else:
+            cfg.tokenizer_name = "whitespace"
         cfg.tokenizer_mode = tm
-        data = load_training_data_to_device(cfg, device)
+        data = load_training_data(cfg, device)
         run_name = f"tok_{tm}"
         res = run_one(cfg, output_root, "tokenizer_compare", run_name, device, data)
         rows.append(make_row(cfg, res, "tokenizer_mode", tm))
@@ -623,7 +734,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="IMDB sentiment experiments")
     p.add_argument(
         "--mode",
-        choices=["single", "sweep", "position", "compare", "tokenizer_compare", "all"],
+        choices=["single", "sweep", "position", "compare", "tokenizer_compare", "test", "all"],
         default="all",
     )
     p.add_argument("--output-dir", type=str, default="output")
@@ -635,16 +746,16 @@ def parse_args():
     p.add_argument("--pos-encoding-mode", choices=["sinusoidal", "rope", "none"], default="rope")
     p.add_argument("--causal", action="store_true")
 
-    p.add_argument("--embed-dim", type=int, default=256)
-    p.add_argument("--num-heads", type=int, default=4)
-    p.add_argument("--num-layers", type=int, default=8)
-    p.add_argument("--hidden-dim", type=int, default=256)
+    p.add_argument("--embed-dim", type=int, default=256) # Attention模型使用
+    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=1)
+    p.add_argument("--hidden-dim", type=int, default=256) # RNN模型使用
 
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument("--weight-decay", type=float, default=1e-3)
 
-    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--epochs", type=int, default=10)
 
     p.add_argument("--max-vocab-size", type=int, default=60000)
@@ -695,7 +806,11 @@ def main():
             run_tokenizer_compare(cfg, output_root, device)
             return
 
-        data = load_training_data_to_device(cfg, device)
+        if args.mode == "test":
+            test_model(output_root, device)
+            return
+
+        data = load_training_data(cfg, device)
 
         if args.mode == "single":
             run_one(cfg, output_root, "single", f"{cfg.model_type}_single", device, data)
@@ -739,5 +854,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # python train_eval.py 
-    # 可自选参数：--mode all 或 --mode single 或 --mode tokenizer_compare 或 --mode compare 或 --mode position 或 --mode sweep
+    # CUDA_VISIBLE_DEVICES=5 python train_eval.py --batch-size 512
+    # 可自选参数：--mode all | single | sweep | position | compare | tokenizer_compare | test

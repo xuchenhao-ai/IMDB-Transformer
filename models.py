@@ -222,7 +222,15 @@ class AttentionClassifier(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(embed_dim) for _ in range(num_layers)])
 
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(embed_dim, 1)
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim // 2, 1)
+        )
 
     def forward(self, x: torch.Tensor):
         """
