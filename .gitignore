@@ -4,12 +4,12 @@ __pycache__/
 
 # 实验输出
 output/
-logs/
-*.pt
-*.png
 
 # VSCode
 .vscode/
 
 # 系统文件
 .DS_Store
+
+# 数据集
+.csv
